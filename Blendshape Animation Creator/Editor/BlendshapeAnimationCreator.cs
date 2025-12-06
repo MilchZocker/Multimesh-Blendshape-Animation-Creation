@@ -1,15 +1,38 @@
-using System.Collections;
 using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
 using UnityEditor;
 using UnityEngine;
-using System.IO;
-using System.Collections.Generic;
 
 public class BlendshapeAnimationCreator : EditorWindow
 {
-    private string blendshapeName = "example"; // Default blendshape name
-    private string savePath = "Assets/Animations";   // Default save path for animations
-    private string animationNamePrefix = "BlendshapeAnimation"; // Default animation name prefix
+    private string blendshapePattern = "Breast_Big*";   // Supports '*' wildcards
+    private string savePath = "Assets/Animations";
+    private string animationNamePrefix = "BlendshapeAnimation";
+
+    private float startValue = 0f;
+    private float endValue = 100f;
+    private float duration = 1f;
+
+    private GenerationMode generationMode = GenerationMode.SingleClip;
+    private CurveMode curveMode = CurveMode.Linear;
+
+    private bool caseInsensitive = true;
+    private bool logPreviewOnly = false;
+
+    private enum GenerationMode
+    {
+        SingleClip,         // one clip going Start -> End
+        TwoConstantClips,   // two clips with constant Start and constant End
+        PingPong            // Start -> End -> Start
+    }
+
+    private enum CurveMode
+    {
+        Linear,
+        EaseInOut,
+        Constant
+    }
 
     [MenuItem("Tools/Blendshape Animation Creator")]
     public static void ShowWindow()
@@ -21,11 +44,54 @@ public class BlendshapeAnimationCreator : EditorWindow
     {
         GUILayout.Label("Blendshape Animation Creator", EditorStyles.boldLabel);
 
-        blendshapeName = EditorGUILayout.TextField("Blendshape Name", blendshapeName);
+        blendshapePattern = EditorGUILayout.TextField(
+            new GUIContent("Blendshape Pattern",
+            "Use * as wildcard.\n" +
+            "*Name = ends with\n" +
+            "Name* = starts with\n" +
+            "*Name* = contains\n" +
+            "No * = exact match"),
+            blendshapePattern);
+
+        caseInsensitive = EditorGUILayout.Toggle(
+            new GUIContent("Case Insensitive"), caseInsensitive);
+
+        EditorGUILayout.Space(6);
+
         savePath = EditorGUILayout.TextField("Save Path", savePath);
         animationNamePrefix = EditorGUILayout.TextField("Animation Name Prefix", animationNamePrefix);
 
-        if (GUILayout.Button("Create Animations"))
+        EditorGUILayout.Space(8);
+        GUILayout.Label("Value / Timing", EditorStyles.boldLabel);
+
+        startValue = EditorGUILayout.Slider(
+            new GUIContent("Start Value", "Blendshape weight at time 0"),
+            startValue, 0f, 100f);
+
+        endValue = EditorGUILayout.Slider(
+            new GUIContent("End Value", "Blendshape weight at clip end"),
+            endValue, 0f, 100f);
+
+        duration = EditorGUILayout.FloatField(
+            new GUIContent("Duration (sec)", "Clip length in seconds"),
+            Mathf.Max(0.01f, duration));
+
+        EditorGUILayout.Space(8);
+        GUILayout.Label("Generation Options", EditorStyles.boldLabel);
+
+        generationMode = (GenerationMode)EditorGUILayout.EnumPopup(
+            new GUIContent("Generation Mode"), generationMode);
+
+        curveMode = (CurveMode)EditorGUILayout.EnumPopup(
+            new GUIContent("Curve Mode"), curveMode);
+
+        logPreviewOnly = EditorGUILayout.Toggle(
+            new GUIContent("Preview Matches Only", "If enabled, no clips are created; matches are logged."),
+            logPreviewOnly);
+
+        EditorGUILayout.Space(10);
+
+        if (GUILayout.Button(logPreviewOnly ? "Preview Matches" : "Create Animations"))
         {
             CreateAnimations();
         }
@@ -33,9 +99,9 @@ public class BlendshapeAnimationCreator : EditorWindow
 
     private void CreateAnimations()
     {
-        if (string.IsNullOrEmpty(blendshapeName))
+        if (string.IsNullOrEmpty(blendshapePattern))
         {
-            Debug.LogError("Blendshape name cannot be empty.");
+            Debug.LogError("Blendshape pattern cannot be empty.");
             return;
         }
 
@@ -51,99 +117,211 @@ public class BlendshapeAnimationCreator : EditorWindow
             return;
         }
 
-        // Ensure the save path exists
+        // Ensure folder exists
         if (!Directory.Exists(savePath))
         {
             Directory.CreateDirectory(savePath);
-            AssetDatabase.Refresh(); // Refresh the AssetDatabase to recognize the new directory
+            AssetDatabase.Refresh();
         }
 
-        // Create two animation clips: one for 0 and one for 100
-        CreateAnimation(0);   // Animation for weight 0
-        CreateAnimation(100); // Animation for weight 100
+        // Find matches once (across all renderers)
+        var renderers = FindObjectsOfType<SkinnedMeshRenderer>();
+        if (renderers == null || renderers.Length == 0)
+        {
+            Debug.LogWarning("No SkinnedMeshRenderers found in the scene.");
+            return;
+        }
+
+        int totalMatches = 0;
+        foreach (var r in renderers)
+        {
+            totalMatches += GetMatchingBlendshapes(r, blendshapePattern).Count;
+        }
+
+        if (totalMatches == 0)
+        {
+            Debug.LogWarning($"No blendshapes matched pattern '{blendshapePattern}'.");
+            return;
+        }
+
+        Debug.Log($"Pattern '{blendshapePattern}' matched {totalMatches} blendshape(s).");
+
+        if (logPreviewOnly)
+        {
+            foreach (var r in renderers)
+            {
+                var matches = GetMatchingBlendshapes(r, blendshapePattern);
+                foreach (var m in matches)
+                    Debug.Log($"[Preview] {r.name} -> {m}");
+            }
+            return;
+        }
+
+        switch (generationMode)
+        {
+            case GenerationMode.SingleClip:
+                CreateAnimationClip(startValue, endValue, duration, false);
+                break;
+
+            case GenerationMode.TwoConstantClips:
+                CreateConstantClip(startValue);
+                CreateConstantClip(endValue);
+                break;
+
+            case GenerationMode.PingPong:
+                CreateAnimationClip(startValue, endValue, duration, true);
+                break;
+        }
 
         AssetDatabase.SaveAssets();
         AssetDatabase.Refresh();
-
         Debug.Log("Animations created successfully.");
     }
 
-    private void CreateAnimation(float weight)
+    private void CreateConstantClip(float value)
     {
-        // Create a new animation clip
-        AnimationClip clip = new AnimationClip();
+        AnimationClip clip = new AnimationClip { legacy = false };
 
-        // Set the clip to be non-legacy (Mecanim-compatible)
-        clip.legacy = false;
-
-        // Find all SkinnedMeshRenderers in the scene
-        SkinnedMeshRenderer[] skinnedMeshRenderers = FindObjectsOfType<SkinnedMeshRenderer>();
-
-        foreach (var renderer in skinnedMeshRenderers)
+        foreach (var r in FindObjectsOfType<SkinnedMeshRenderer>())
         {
-            // Check for blendshape variations
-            List<string> blendshapeVariations = GetBlendshapeVariations(blendshapeName);
-            foreach (var variation in blendshapeVariations)
+            foreach (var blendshape in GetMatchingBlendshapes(r, blendshapePattern))
             {
-                int blendShapeIndex = renderer.sharedMesh.GetBlendShapeIndex(variation);
-                if (blendShapeIndex != -1)
-                {
-                    // Create animation curve for this blendshape
-                    AnimationCurve curve = AnimationCurve.Linear(0, weight, 1, weight); // Constant weight over 1 second
-                    string propertyName = $"blendShape.{variation}";
+                var curve = AnimationCurve.Linear(0f, value, duration, value);
 
-                    // Bind the curve to the SkinnedMeshRenderer
-                    EditorCurveBinding binding = new EditorCurveBinding
-                    {
-                        path = AnimationUtility.CalculateTransformPath(renderer.transform, renderer.rootBone), // Path from root
-                        type = typeof(SkinnedMeshRenderer),
-                        propertyName = propertyName
-                    };
-
-                    AnimationUtility.SetEditorCurve(clip, binding, curve);
-                    Debug.Log($"Animation curve set for '{variation}' on '{renderer.name}'");
-                }
-                else
+                var binding = new EditorCurveBinding
                 {
-                    Debug.LogWarning($"Blendshape '{variation}' not found on {renderer.name}.");
-                }
+                    path = GetRendererPath(r),
+                    type = typeof(SkinnedMeshRenderer),
+                    propertyName = $"blendShape.{blendshape}"
+                };
+
+                AnimationUtility.SetEditorCurve(clip, binding, curve);
             }
         }
 
-        // Save the animation clip
-        string animationName = $"{animationNamePrefix}_{weight}.anim";
-        string fullPath = $"{savePath}/{animationName}";
+        SaveClip(clip, $"{animationNamePrefix}_{value:0.##}");
+    }
 
-        try
+    private void CreateAnimationClip(float start, float end, float time, bool pingPong)
+    {
+        AnimationClip clip = new AnimationClip { legacy = false };
+
+        foreach (var r in FindObjectsOfType<SkinnedMeshRenderer>())
         {
-            AssetDatabase.CreateAsset(clip, fullPath);
-            Debug.Log($"Animation '{animationName}' created successfully at {fullPath}");
+            foreach (var blendshape in GetMatchingBlendshapes(r, blendshapePattern))
+            {
+                AnimationCurve curve;
+
+                if (!pingPong)
+                {
+                    curve = BuildCurve(start, end, time);
+                }
+                else
+                {
+                    // Start -> End -> Start over full duration
+                    float midT = time * 0.5f;
+                    curve = new AnimationCurve(
+                        new Keyframe(0f, start),
+                        new Keyframe(midT, end),
+                        new Keyframe(time, start)
+                    );
+                    ApplyCurveModeTangents(curve);
+                }
+
+                var binding = new EditorCurveBinding
+                {
+                    path = GetRendererPath(r),
+                    type = typeof(SkinnedMeshRenderer),
+                    propertyName = $"blendShape.{blendshape}"
+                };
+
+                AnimationUtility.SetEditorCurve(clip, binding, curve);
+            }
         }
-        catch (UnityException e)
+
+        string modeSuffix = pingPong ? "PingPong" : "Range";
+        SaveClip(clip, $"{animationNamePrefix}_{modeSuffix}_{start:0.##}to{end:0.##}");
+    }
+
+    private AnimationCurve BuildCurve(float start, float end, float time)
+    {
+        AnimationCurve curve;
+
+        switch (curveMode)
         {
-            Debug.LogError($"Failed to create animation asset at {fullPath}: {e.Message}");
+            case CurveMode.Constant:
+                curve = AnimationCurve.Linear(0f, start, time, start);
+                break;
+
+            case CurveMode.EaseInOut:
+                curve = AnimationCurve.EaseInOut(0f, start, time, end);
+                break;
+
+            default:
+                curve = AnimationCurve.Linear(0f, start, time, end);
+                break;
+        }
+
+        ApplyCurveModeTangents(curve);
+        return curve;
+    }
+
+    private void ApplyCurveModeTangents(AnimationCurve curve)
+    {
+        if (curveMode == CurveMode.EaseInOut || curve.length < 2)
+            return;
+
+        for (int i = 0; i < curve.length; i++)
+        {
+            AnimationUtility.SetKeyLeftTangentMode(curve, i, AnimationUtility.TangentMode.Linear);
+            AnimationUtility.SetKeyRightTangentMode(curve, i, AnimationUtility.TangentMode.Linear);
         }
     }
 
-    private List<string> GetBlendshapeVariations(string baseName)
+    private void SaveClip(AnimationClip clip, string fileNameNoExt)
     {
-        // Create a list of possible variations for the blendshape name
-        List<string> variations = new List<string>
+        string fullPath = $"{savePath}/{fileNameNoExt}.anim";
+        fullPath = AssetDatabase.GenerateUniqueAssetPath(fullPath);
+
+        AssetDatabase.CreateAsset(clip, fullPath);
+        Debug.Log($"Animation '{fileNameNoExt}' created at {fullPath}");
+    }
+
+    private string GetRendererPath(SkinnedMeshRenderer renderer)
+    {
+        // Use rootBone if present, otherwise fallback to transform root.
+        Transform root = renderer.rootBone != null ? renderer.rootBone : renderer.transform.root;
+        return AnimationUtility.CalculateTransformPath(renderer.transform, root);
+    }
+
+    private List<string> GetMatchingBlendshapes(SkinnedMeshRenderer renderer, string pattern)
+    {
+        var results = new List<string>();
+        var mesh = renderer.sharedMesh;
+        if (mesh == null) return results;
+
+        Regex regex = WildcardToRegex(pattern, caseInsensitive);
+
+        int count = mesh.blendShapeCount;
+        for (int i = 0; i < count; i++)
         {
-            baseName,
-            baseName.Replace("_", " "), // Replace underscores with spaces
-            baseName.Replace("_", "").Replace(" ", "").ToLower(), // Remove spaces and underscores, lowercase
-            baseName.Replace("_", "").Replace(" ", "").ToUpper(), // Remove spaces and underscores, uppercase
-            baseName.Replace("_", " ").ToLower(), // Lowercase with spaces
-            baseName.Replace("_", " ").ToUpper() // Uppercase with spaces
-        };
+            string name = mesh.GetBlendShapeName(i);
+            if (regex.IsMatch(name))
+                results.Add(name);
+        }
 
-        // Add more variations as needed
-        variations.Add($"Big {baseName.Replace("_", " ")}");
-        variations.Add($"{baseName.Replace("_", " ")} Big");
-        variations.Add($"Big {baseName}");
-        variations.Add($"{baseName} Big");
+        return results;
+    }
 
-        return variations;
+    private Regex WildcardToRegex(string pattern, bool insensitive)
+    {
+        // Escape regex special chars except '*'
+        string escaped = Regex.Escape(pattern).Replace("\\*", ".*");
+        string rx = $"^{escaped}$";  // whole-string match
+
+        var opts = RegexOptions.Compiled;
+        if (insensitive) opts |= RegexOptions.IgnoreCase;
+
+        return new Regex(rx, opts);
     }
 }
